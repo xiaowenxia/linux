@@ -8,14 +8,6 @@
  * Copyright (C)      2016  Kees Cook
  */
 
-/*
- * Since we're dealing with identity mappings, physical and virtual
- * addresses are the same, so override these defines which are ultimately
- * used by the headers in misc.h.
- */
-#define __pa(x)  ((unsigned long)(x))
-#define __va(x)  ((void *)((unsigned long)(x)))
-
 /* No PAGE_TABLE_ISOLATION support needed either: */
 #undef CONFIG_PAGE_TABLE_ISOLATION
 
@@ -67,6 +59,14 @@ static void *alloc_pgt_page(void *context)
 		return NULL;
 	}
 
+	/* Consumed more tables than expected? */
+	if (pages->pgt_buf_offset == BOOT_PGT_SIZE_WARN) {
+		debug_putstr("pgt_buf running low in " __FILE__ "\n");
+		debug_putstr("Need to raise BOOT_PGT_SIZE?\n");
+		debug_putaddr(pages->pgt_buf_offset);
+		debug_putaddr(pages->pgt_buf_size);
+	}
+
 	entry = pages->pgt_buf + pages->pgt_buf_offset;
 	pages->pgt_buf_offset += PAGE_SIZE;
 
@@ -110,6 +110,7 @@ void kernel_add_identity_map(unsigned long start, unsigned long end)
 void initialize_identity_maps(void *rmode)
 {
 	unsigned long cmdline;
+	struct setup_data *sd;
 
 	/* Exclude the encryption mask from __PHYSICAL_MASK */
 	physical_mask &= ~sme_me_mask;
@@ -158,15 +159,34 @@ void initialize_identity_maps(void *rmode)
 	 * or does not touch all the pages covering them.
 	 */
 	kernel_add_identity_map((unsigned long)_head, (unsigned long)_end);
-	boot_params = rmode;
-	kernel_add_identity_map((unsigned long)boot_params, (unsigned long)(boot_params + 1));
+	boot_params_ptr = rmode;
+	kernel_add_identity_map((unsigned long)boot_params_ptr,
+				(unsigned long)(boot_params_ptr + 1));
 	cmdline = get_cmd_line_ptr();
 	kernel_add_identity_map(cmdline, cmdline + COMMAND_LINE_SIZE);
+
+	/*
+	 * Also map the setup_data entries passed via boot_params in case they
+	 * need to be accessed by uncompressed kernel via the identity mapping.
+	 */
+	sd = (struct setup_data *)boot_params_ptr->hdr.setup_data;
+	while (sd) {
+		unsigned long sd_addr = (unsigned long)sd;
+
+		kernel_add_identity_map(sd_addr, sd_addr + sizeof(*sd) + sd->len);
+		sd = (struct setup_data *)sd->next;
+	}
 
 	sev_prep_identity_maps(top_level_pgt);
 
 	/* Load the new page-table. */
 	write_cr3(top_level_pgt);
+
+	/*
+	 * Now that the required page table mappings are established and a
+	 * GHCB can be used, check for SNP guest/HV feature compatibility.
+	 */
+	snp_check_features();
 }
 
 static pte_t *split_large_pmd(struct x86_mapping_info *info,

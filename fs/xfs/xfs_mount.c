@@ -34,6 +34,7 @@
 #include "xfs_health.h"
 #include "xfs_trace.h"
 #include "xfs_ag.h"
+#include "scrub/stats.h"
 
 static DEFINE_MUTEX(xfs_uuid_table_mutex);
 static int xfs_uuid_table_size;
@@ -300,25 +301,27 @@ xfs_validate_new_dalign(
 	"alignment check failed: sunit/swidth vs. blocksize(%d)",
 			mp->m_sb.sb_blocksize);
 		return -EINVAL;
-	} else {
-		/*
-		 * Convert the stripe unit and width to FSBs.
-		 */
-		mp->m_dalign = XFS_BB_TO_FSBT(mp, mp->m_dalign);
-		if (mp->m_dalign && (mp->m_sb.sb_agblocks % mp->m_dalign)) {
-			xfs_warn(mp,
-		"alignment check failed: sunit/swidth vs. agsize(%d)",
-				 mp->m_sb.sb_agblocks);
-			return -EINVAL;
-		} else if (mp->m_dalign) {
-			mp->m_swidth = XFS_BB_TO_FSBT(mp, mp->m_swidth);
-		} else {
-			xfs_warn(mp,
-		"alignment check failed: sunit(%d) less than bsize(%d)",
-				 mp->m_dalign, mp->m_sb.sb_blocksize);
-			return -EINVAL;
-		}
 	}
+
+	/*
+	 * Convert the stripe unit and width to FSBs.
+	 */
+	mp->m_dalign = XFS_BB_TO_FSBT(mp, mp->m_dalign);
+	if (mp->m_dalign && (mp->m_sb.sb_agblocks % mp->m_dalign)) {
+		xfs_warn(mp,
+	"alignment check failed: sunit/swidth vs. agsize(%d)",
+			mp->m_sb.sb_agblocks);
+		return -EINVAL;
+	}
+
+	if (!mp->m_dalign) {
+		xfs_warn(mp,
+	"alignment check failed: sunit(%d) less than bsize(%d)",
+			mp->m_dalign, mp->m_sb.sb_blocksize);
+		return -EINVAL;
+	}
+
+	mp->m_swidth = XFS_BB_TO_FSBT(mp, mp->m_swidth);
 
 	if (!xfs_has_dalign(mp)) {
 		xfs_warn(mp,
@@ -536,6 +539,20 @@ xfs_check_summary_counts(
 	return 0;
 }
 
+static void
+xfs_unmount_check(
+	struct xfs_mount	*mp)
+{
+	if (xfs_is_shutdown(mp))
+		return;
+
+	if (percpu_counter_sum(&mp->m_ifree) >
+			percpu_counter_sum(&mp->m_icount)) {
+		xfs_alert(mp, "ifree/icount mismatch at unmount");
+		xfs_fs_mark_sick(mp, XFS_SICK_FS_COUNTERS);
+	}
+}
+
 /*
  * Flush and reclaim dirty inodes in preparation for unmount. Inodes and
  * internal inode structures can be sitting in the CIL and AIL at this point,
@@ -700,9 +717,11 @@ xfs_mountfs(
 	if (error)
 		goto out_remove_sysfs;
 
+	xchk_stats_register(mp->m_scrub_stats, mp->m_debugfs);
+
 	error = xfs_error_sysfs_init(mp);
 	if (error)
-		goto out_del_stats;
+		goto out_remove_scrub_stats;
 
 	error = xfs_errortag_init(mp);
 	if (error)
@@ -778,7 +797,8 @@ xfs_mountfs(
 	/*
 	 * Allocate and initialize the per-ag data.
 	 */
-	error = xfs_initialize_perag(mp, sbp->sb_agcount, &mp->m_maxagi);
+	error = xfs_initialize_perag(mp, sbp->sb_agcount, mp->m_sb.sb_dblocks,
+			&mp->m_maxagi);
 	if (error) {
 		xfs_warn(mp, "Failed per-ag init: %d", error);
 		goto out_free_dir;
@@ -1001,7 +1021,7 @@ xfs_mountfs(
  out_log_dealloc:
 	xfs_log_mount_cancel(mp);
  out_inodegc_shrinker:
-	unregister_shrinker(&mp->m_inodegc_shrinker);
+	shrinker_free(mp->m_inodegc_shrinker);
  out_fail_wait:
 	if (mp->m_logdev_targp && mp->m_logdev_targp != mp->m_ddev_targp)
 		xfs_buftarg_drain(mp->m_logdev_targp);
@@ -1016,7 +1036,8 @@ xfs_mountfs(
 	xfs_errortag_del(mp);
  out_remove_error_sysfs:
 	xfs_error_sysfs_del(mp);
- out_del_stats:
+ out_remove_scrub_stats:
+	xchk_stats_unregister(mp->m_scrub_stats);
 	xfs_sysfs_del(&mp->m_stats.xs_kobj);
  out_remove_sysfs:
 	xfs_sysfs_del(&mp->m_kobj);
@@ -1074,6 +1095,7 @@ xfs_unmountfs(
 	if (error)
 		xfs_warn(mp, "Unable to free reserved block pool. "
 				"Freespace may not be correct on next mount.");
+	xfs_unmount_check(mp);
 
 	xfs_log_unmount(mp);
 	xfs_da_unmount(mp);
@@ -1082,11 +1104,12 @@ xfs_unmountfs(
 #if defined(DEBUG)
 	xfs_errortag_clearall(mp);
 #endif
-	unregister_shrinker(&mp->m_inodegc_shrinker);
+	shrinker_free(mp->m_inodegc_shrinker);
 	xfs_free_perag(mp);
 
 	xfs_errortag_del(mp);
 	xfs_error_sysfs_del(mp);
+	xchk_stats_unregister(mp->m_scrub_stats);
 	xfs_sysfs_del(&mp->m_stats.xs_kobj);
 	xfs_sysfs_del(&mp->m_kobj);
 }
@@ -1356,7 +1379,6 @@ xfs_clear_incompat_log_features(
 
 	if (xfs_sb_has_incompat_log_feature(&mp->m_sb,
 				XFS_SB_FEAT_INCOMPAT_LOG_ALL)) {
-		xfs_info(mp, "Clearing log incompat feature flags.");
 		xfs_sb_remove_incompat_log_features(&mp->m_sb);
 		ret = true;
 	}

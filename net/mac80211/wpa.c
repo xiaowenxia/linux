@@ -3,7 +3,7 @@
  * Copyright 2002-2004, Instant802 Networks, Inc.
  * Copyright 2008, Jouni Malinen <j@w1.fi>
  * Copyright (C) 2016-2017 Intel Deutschland GmbH
- * Copyright (C) 2020-2021 Intel Corporation
+ * Copyright (C) 2020-2023 Intel Corporation
  */
 
 #include <linux/netdevice.h>
@@ -15,7 +15,7 @@
 #include <asm/unaligned.h>
 #include <net/mac80211.h>
 #include <crypto/aes.h>
-#include <crypto/algapi.h>
+#include <crypto/utils.h>
 
 #include "ieee80211_i.h"
 #include "michael.h"
@@ -142,7 +142,7 @@ ieee80211_rx_h_michael_mic_verify(struct ieee80211_rx_data *rx)
 		 * group keys and only the AP is sending real multicast
 		 * frames in the BSS.
 		 */
-		return RX_DROP_UNUSABLE;
+		return RX_DROP_U_AP_RX_GROUPCAST;
 	}
 
 	if (status->flag & RX_FLAG_MMIC_ERROR)
@@ -150,10 +150,10 @@ ieee80211_rx_h_michael_mic_verify(struct ieee80211_rx_data *rx)
 
 	hdrlen = ieee80211_hdrlen(hdr->frame_control);
 	if (skb->len < hdrlen + MICHAEL_MIC_LEN)
-		return RX_DROP_UNUSABLE;
+		return RX_DROP_U_SHORT_MMIC;
 
 	if (skb_linearize(rx->skb))
-		return RX_DROP_UNUSABLE;
+		return RX_DROP_U_OOM;
 	hdr = (void *)skb->data;
 
 	data = skb->data + hdrlen;
@@ -188,7 +188,7 @@ mic_fail_no_key:
 				     NL80211_KEYTYPE_PAIRWISE,
 				     rx->key ? rx->key->conf.keyidx : -1,
 				     NULL, GFP_ATOMIC);
-	return RX_DROP_UNUSABLE;
+	return RX_DROP_U_MMIC_FAIL;
 }
 
 static int tkip_encrypt_skb(struct ieee80211_tx_data *tx, struct sk_buff *skb)
@@ -276,11 +276,11 @@ ieee80211_crypto_tkip_decrypt(struct ieee80211_rx_data *rx)
 		return RX_CONTINUE;
 
 	if (!rx->sta || skb->len - hdrlen < 12)
-		return RX_DROP_UNUSABLE;
+		return RX_DROP_U_SHORT_TKIP;
 
 	/* it may be possible to optimize this a bit more */
 	if (skb_linearize(rx->skb))
-		return RX_DROP_UNUSABLE;
+		return RX_DROP_U_OOM;
 	hdr = (void *)skb->data;
 
 	/*
@@ -298,7 +298,7 @@ ieee80211_crypto_tkip_decrypt(struct ieee80211_rx_data *rx)
 					  &rx->tkip.iv32,
 					  &rx->tkip.iv16);
 	if (res != TKIP_DECRYPT_OK)
-		return RX_DROP_UNUSABLE;
+		return RX_DROP_U_TKIP_FAIL;
 
 	/* Trim ICV */
 	if (!(status->flag & RX_FLAG_ICV_STRIPPED))
@@ -351,7 +351,7 @@ static u8 ccmp_gcmp_aad(struct sk_buff *skb, u8 *aad)
 	 * FC | A1 | A2 | A3 | SC | [A4] | [QC] */
 	put_unaligned_be16(len_a, &aad[0]);
 	put_unaligned(mask_fc, (__le16 *)&aad[2]);
-	memcpy(&aad[4], &hdr->addr1, 3 * ETH_ALEN);
+	memcpy(&aad[4], &hdr->addrs, 3 * ETH_ALEN);
 
 	/* Mask Seq#, leave Frag# */
 	aad[22] = *((u8 *) &hdr->seq_ctrl) & 0x0f;
@@ -523,12 +523,12 @@ ieee80211_crypto_ccmp_decrypt(struct ieee80211_rx_data *rx,
 
 	if (status->flag & RX_FLAG_DECRYPTED) {
 		if (!pskb_may_pull(rx->skb, hdrlen + IEEE80211_CCMP_HDR_LEN))
-			return RX_DROP_UNUSABLE;
+			return RX_DROP_U_SHORT_CCMP;
 		if (status->flag & RX_FLAG_MIC_STRIPPED)
 			mic_len = 0;
 	} else {
 		if (skb_linearize(rx->skb))
-			return RX_DROP_UNUSABLE;
+			return RX_DROP_U_OOM;
 	}
 
 	/* reload hdr - skb might have been reallocated */
@@ -536,7 +536,7 @@ ieee80211_crypto_ccmp_decrypt(struct ieee80211_rx_data *rx,
 
 	data_len = skb->len - hdrlen - IEEE80211_CCMP_HDR_LEN - mic_len;
 	if (!rx->sta || data_len < 0)
-		return RX_DROP_UNUSABLE;
+		return RX_DROP_U_SHORT_CCMP;
 
 	if (!(status->flag & RX_FLAG_PN_VALIDATED)) {
 		int res;
@@ -550,7 +550,7 @@ ieee80211_crypto_ccmp_decrypt(struct ieee80211_rx_data *rx,
 		if (res < 0 ||
 		    (!res && !(status->flag & RX_FLAG_ALLOW_SAME_PN))) {
 			key->u.ccmp.replays++;
-			return RX_DROP_UNUSABLE;
+			return RX_DROP_U_REPLAY;
 		}
 
 		if (!(status->flag & RX_FLAG_DECRYPTED)) {
@@ -564,7 +564,7 @@ ieee80211_crypto_ccmp_decrypt(struct ieee80211_rx_data *rx,
 				    skb->data + hdrlen + IEEE80211_CCMP_HDR_LEN,
 				    data_len,
 				    skb->data + skb->len - mic_len))
-				return RX_DROP_UNUSABLE;
+				return RX_DROP_U_MIC_FAIL;
 		}
 
 		memcpy(key->u.ccmp.rx_pn[queue], pn, IEEE80211_CCMP_PN_LEN);
@@ -574,7 +574,7 @@ ieee80211_crypto_ccmp_decrypt(struct ieee80211_rx_data *rx,
 
 	/* Remove CCMP header and MIC */
 	if (pskb_trim(skb, skb->len - mic_len))
-		return RX_DROP_UNUSABLE;
+		return RX_DROP_U_SHORT_CCMP_MIC;
 	memmove(skb->data + IEEE80211_CCMP_HDR_LEN, skb->data, hdrlen);
 	skb_pull(skb, IEEE80211_CCMP_HDR_LEN);
 
@@ -719,12 +719,12 @@ ieee80211_crypto_gcmp_decrypt(struct ieee80211_rx_data *rx)
 
 	if (status->flag & RX_FLAG_DECRYPTED) {
 		if (!pskb_may_pull(rx->skb, hdrlen + IEEE80211_GCMP_HDR_LEN))
-			return RX_DROP_UNUSABLE;
+			return RX_DROP_U_SHORT_GCMP;
 		if (status->flag & RX_FLAG_MIC_STRIPPED)
 			mic_len = 0;
 	} else {
 		if (skb_linearize(rx->skb))
-			return RX_DROP_UNUSABLE;
+			return RX_DROP_U_OOM;
 	}
 
 	/* reload hdr - skb might have been reallocated */
@@ -732,7 +732,7 @@ ieee80211_crypto_gcmp_decrypt(struct ieee80211_rx_data *rx)
 
 	data_len = skb->len - hdrlen - IEEE80211_GCMP_HDR_LEN - mic_len;
 	if (!rx->sta || data_len < 0)
-		return RX_DROP_UNUSABLE;
+		return RX_DROP_U_SHORT_GCMP;
 
 	if (!(status->flag & RX_FLAG_PN_VALIDATED)) {
 		int res;
@@ -746,7 +746,7 @@ ieee80211_crypto_gcmp_decrypt(struct ieee80211_rx_data *rx)
 		if (res < 0 ||
 		    (!res && !(status->flag & RX_FLAG_ALLOW_SAME_PN))) {
 			key->u.gcmp.replays++;
-			return RX_DROP_UNUSABLE;
+			return RX_DROP_U_REPLAY;
 		}
 
 		if (!(status->flag & RX_FLAG_DECRYPTED)) {
@@ -761,7 +761,7 @@ ieee80211_crypto_gcmp_decrypt(struct ieee80211_rx_data *rx)
 				    data_len,
 				    skb->data + skb->len -
 				    IEEE80211_GCMP_MIC_LEN))
-				return RX_DROP_UNUSABLE;
+				return RX_DROP_U_MIC_FAIL;
 		}
 
 		memcpy(key->u.gcmp.rx_pn[queue], pn, IEEE80211_GCMP_PN_LEN);
@@ -771,105 +771,9 @@ ieee80211_crypto_gcmp_decrypt(struct ieee80211_rx_data *rx)
 
 	/* Remove GCMP header and MIC */
 	if (pskb_trim(skb, skb->len - mic_len))
-		return RX_DROP_UNUSABLE;
+		return RX_DROP_U_SHORT_GCMP_MIC;
 	memmove(skb->data + IEEE80211_GCMP_HDR_LEN, skb->data, hdrlen);
 	skb_pull(skb, IEEE80211_GCMP_HDR_LEN);
-
-	return RX_CONTINUE;
-}
-
-static ieee80211_tx_result
-ieee80211_crypto_cs_encrypt(struct ieee80211_tx_data *tx,
-			    struct sk_buff *skb)
-{
-	struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)skb->data;
-	struct ieee80211_key *key = tx->key;
-	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
-	int hdrlen;
-	u8 *pos, iv_len = key->conf.iv_len;
-
-	if (info->control.hw_key &&
-	    !(info->control.hw_key->flags & IEEE80211_KEY_FLAG_PUT_IV_SPACE)) {
-		/* hwaccel has no need for preallocated head room */
-		return TX_CONTINUE;
-	}
-
-	if (unlikely(skb_headroom(skb) < iv_len &&
-		     pskb_expand_head(skb, iv_len, 0, GFP_ATOMIC)))
-		return TX_DROP;
-
-	hdrlen = ieee80211_hdrlen(hdr->frame_control);
-
-	pos = skb_push(skb, iv_len);
-	memmove(pos, pos + iv_len, hdrlen);
-
-	return TX_CONTINUE;
-}
-
-static inline int ieee80211_crypto_cs_pn_compare(u8 *pn1, u8 *pn2, int len)
-{
-	int i;
-
-	/* pn is little endian */
-	for (i = len - 1; i >= 0; i--) {
-		if (pn1[i] < pn2[i])
-			return -1;
-		else if (pn1[i] > pn2[i])
-			return 1;
-	}
-
-	return 0;
-}
-
-static ieee80211_rx_result
-ieee80211_crypto_cs_decrypt(struct ieee80211_rx_data *rx)
-{
-	struct ieee80211_key *key = rx->key;
-	struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)rx->skb->data;
-	const struct ieee80211_cipher_scheme *cs = NULL;
-	int hdrlen = ieee80211_hdrlen(hdr->frame_control);
-	struct ieee80211_rx_status *status = IEEE80211_SKB_RXCB(rx->skb);
-	int data_len;
-	u8 *rx_pn;
-	u8 *skb_pn;
-	u8 qos_tid;
-
-	if (!rx->sta || !rx->sta->cipher_scheme ||
-	    !(status->flag & RX_FLAG_DECRYPTED))
-		return RX_DROP_UNUSABLE;
-
-	if (!ieee80211_is_data(hdr->frame_control))
-		return RX_CONTINUE;
-
-	cs = rx->sta->cipher_scheme;
-
-	data_len = rx->skb->len - hdrlen - cs->hdr_len;
-
-	if (data_len < 0)
-		return RX_DROP_UNUSABLE;
-
-	if (ieee80211_is_data_qos(hdr->frame_control))
-		qos_tid = ieee80211_get_tid(hdr);
-	else
-		qos_tid = 0;
-
-	if (skb_linearize(rx->skb))
-		return RX_DROP_UNUSABLE;
-
-	rx_pn = key->u.gen.rx_pn[qos_tid];
-	skb_pn = rx->skb->data + hdrlen + cs->pn_off;
-
-	if (ieee80211_crypto_cs_pn_compare(skb_pn, rx_pn, cs->pn_len) <= 0)
-		return RX_DROP_UNUSABLE;
-
-	memcpy(rx_pn, skb_pn, cs->pn_len);
-
-	/* remove security header and MIC */
-	if (pskb_trim(rx->skb, rx->skb->len - cs->mic_len))
-		return RX_DROP_UNUSABLE;
-
-	memmove(rx->skb->data + cs->hdr_len, rx->skb->data, hdrlen);
-	skb_pull(rx->skb, cs->hdr_len);
 
 	return RX_CONTINUE;
 }
@@ -888,7 +792,7 @@ static void bip_aad(struct sk_buff *skb, u8 *aad)
 				IEEE80211_FCTL_MOREDATA);
 	put_unaligned(mask_fc, (__le16 *) &aad[0]);
 	/* A1 || A2 || A3 */
-	memcpy(aad + 2, &hdr->addr1, 3 * ETH_ALEN);
+	memcpy(aad + 2, &hdr->addrs, 3 * ETH_ALEN);
 }
 
 
@@ -1020,19 +924,19 @@ ieee80211_crypto_aes_cmac_decrypt(struct ieee80211_rx_data *rx)
 	/* management frames are already linear */
 
 	if (skb->len < 24 + sizeof(*mmie))
-		return RX_DROP_UNUSABLE;
+		return RX_DROP_U_SHORT_CMAC;
 
 	mmie = (struct ieee80211_mmie *)
 		(skb->data + skb->len - sizeof(*mmie));
 	if (mmie->element_id != WLAN_EID_MMIE ||
 	    mmie->length != sizeof(*mmie) - 2)
-		return RX_DROP_UNUSABLE; /* Invalid MMIE */
+		return RX_DROP_U_BAD_MMIE; /* Invalid MMIE */
 
 	bip_ipn_swap(ipn, mmie->sequence_number);
 
 	if (memcmp(ipn, key->u.aes_cmac.rx_pn, 6) <= 0) {
 		key->u.aes_cmac.replays++;
-		return RX_DROP_UNUSABLE;
+		return RX_DROP_U_REPLAY;
 	}
 
 	if (!(status->flag & RX_FLAG_DECRYPTED)) {
@@ -1042,7 +946,7 @@ ieee80211_crypto_aes_cmac_decrypt(struct ieee80211_rx_data *rx)
 				   skb->data + 24, skb->len - 24, mic);
 		if (crypto_memneq(mic, mmie->mic, sizeof(mmie->mic))) {
 			key->u.aes_cmac.icverrors++;
-			return RX_DROP_UNUSABLE;
+			return RX_DROP_U_MIC_FAIL;
 		}
 	}
 
@@ -1070,19 +974,19 @@ ieee80211_crypto_aes_cmac_256_decrypt(struct ieee80211_rx_data *rx)
 	/* management frames are already linear */
 
 	if (skb->len < 24 + sizeof(*mmie))
-		return RX_DROP_UNUSABLE;
+		return RX_DROP_U_SHORT_CMAC256;
 
 	mmie = (struct ieee80211_mmie_16 *)
 		(skb->data + skb->len - sizeof(*mmie));
 	if (mmie->element_id != WLAN_EID_MMIE ||
 	    mmie->length != sizeof(*mmie) - 2)
-		return RX_DROP_UNUSABLE; /* Invalid MMIE */
+		return RX_DROP_U_BAD_MMIE; /* Invalid MMIE */
 
 	bip_ipn_swap(ipn, mmie->sequence_number);
 
 	if (memcmp(ipn, key->u.aes_cmac.rx_pn, 6) <= 0) {
 		key->u.aes_cmac.replays++;
-		return RX_DROP_UNUSABLE;
+		return RX_DROP_U_REPLAY;
 	}
 
 	if (!(status->flag & RX_FLAG_DECRYPTED)) {
@@ -1092,7 +996,7 @@ ieee80211_crypto_aes_cmac_256_decrypt(struct ieee80211_rx_data *rx)
 				       skb->data + 24, skb->len - 24, mic);
 		if (crypto_memneq(mic, mmie->mic, sizeof(mmie->mic))) {
 			key->u.aes_cmac.icverrors++;
-			return RX_DROP_UNUSABLE;
+			return RX_DROP_U_MIC_FAIL;
 		}
 	}
 
@@ -1169,19 +1073,19 @@ ieee80211_crypto_aes_gmac_decrypt(struct ieee80211_rx_data *rx)
 	/* management frames are already linear */
 
 	if (skb->len < 24 + sizeof(*mmie))
-		return RX_DROP_UNUSABLE;
+		return RX_DROP_U_SHORT_GMAC;
 
 	mmie = (struct ieee80211_mmie_16 *)
 		(skb->data + skb->len - sizeof(*mmie));
 	if (mmie->element_id != WLAN_EID_MMIE ||
 	    mmie->length != sizeof(*mmie) - 2)
-		return RX_DROP_UNUSABLE; /* Invalid MMIE */
+		return RX_DROP_U_BAD_MMIE; /* Invalid MMIE */
 
 	bip_ipn_swap(ipn, mmie->sequence_number);
 
 	if (memcmp(ipn, key->u.aes_gmac.rx_pn, 6) <= 0) {
 		key->u.aes_gmac.replays++;
-		return RX_DROP_UNUSABLE;
+		return RX_DROP_U_REPLAY;
 	}
 
 	if (!(status->flag & RX_FLAG_DECRYPTED)) {
@@ -1193,14 +1097,14 @@ ieee80211_crypto_aes_gmac_decrypt(struct ieee80211_rx_data *rx)
 
 		mic = kmalloc(GMAC_MIC_LEN, GFP_ATOMIC);
 		if (!mic)
-			return RX_DROP_UNUSABLE;
+			return RX_DROP_U_OOM;
 		if (ieee80211_aes_gmac(key->u.aes_gmac.tfm, aad, nonce,
 				       skb->data + 24, skb->len - 24,
 				       mic) < 0 ||
 		    crypto_memneq(mic, mmie->mic, sizeof(mmie->mic))) {
 			key->u.aes_gmac.icverrors++;
 			kfree(mic);
-			return RX_DROP_UNUSABLE;
+			return RX_DROP_U_MIC_FAIL;
 		}
 		kfree(mic);
 	}
@@ -1211,39 +1115,4 @@ ieee80211_crypto_aes_gmac_decrypt(struct ieee80211_rx_data *rx)
 	skb_trim(skb, skb->len - sizeof(*mmie));
 
 	return RX_CONTINUE;
-}
-
-ieee80211_tx_result
-ieee80211_crypto_hw_encrypt(struct ieee80211_tx_data *tx)
-{
-	struct sk_buff *skb;
-	struct ieee80211_tx_info *info = NULL;
-	ieee80211_tx_result res;
-
-	skb_queue_walk(&tx->skbs, skb) {
-		info  = IEEE80211_SKB_CB(skb);
-
-		/* handle hw-only algorithm */
-		if (!info->control.hw_key)
-			return TX_DROP;
-
-		if (tx->key->flags & KEY_FLAG_CIPHER_SCHEME) {
-			res = ieee80211_crypto_cs_encrypt(tx, skb);
-			if (res != TX_CONTINUE)
-				return res;
-		}
-	}
-
-	ieee80211_tx_set_protected(tx);
-
-	return TX_CONTINUE;
-}
-
-ieee80211_rx_result
-ieee80211_crypto_hw_decrypt(struct ieee80211_rx_data *rx)
-{
-	if (rx->sta && rx->sta->cipher_scheme)
-		return ieee80211_crypto_cs_decrypt(rx);
-
-	return RX_DROP_UNUSABLE;
 }

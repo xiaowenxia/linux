@@ -180,7 +180,7 @@ static void sci_io_request_build_ssp_command_iu(struct isci_request *ireq)
 	cmd_iu->_r_a = 0;
 	cmd_iu->_r_b = 0;
 	cmd_iu->en_fburst = 0; /* unsupported */
-	cmd_iu->task_prio = task->ssp_task.task_prio;
+	cmd_iu->task_prio = 0;
 	cmd_iu->task_attr = task->ssp_task.task_attr;
 	cmd_iu->_r_c = 0;
 
@@ -2182,7 +2182,7 @@ static enum sci_status atapi_data_tc_completion_handler(struct isci_request *ire
 	case (SCU_TASK_DONE_UNEXP_FIS << SCU_COMPLETION_TL_STATUS_SHIFT): {
 		u16 len = sci_req_tx_bytes(ireq);
 
-		/* likely non-error data underrrun, workaround missing
+		/* likely non-error data underrun, workaround missing
 		 * d2h frame from the controller
 		 */
 		if (d2h->fis_type != FIS_REGD2H) {

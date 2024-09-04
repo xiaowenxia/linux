@@ -752,8 +752,8 @@ static void xenbus_probe(void)
 	xenstored_ready = 1;
 
 	if (!xen_store_interface) {
-		xen_store_interface = xen_remap(xen_store_gfn << XEN_PAGE_SHIFT,
-						XEN_PAGE_SIZE);
+		xen_store_interface = memremap(xen_store_gfn << XEN_PAGE_SHIFT,
+					       XEN_PAGE_SIZE, MEMREMAP_WB);
 		/*
 		 * Now it is safe to free the IRQ used for xenstore late
 		 * initialization. No need to unbind: it is about to be
@@ -811,6 +811,9 @@ static int xenbus_probe_thread(void *unused)
 
 static int __init xenbus_probe_initcall(void)
 {
+	if (!xen_domain())
+		return -ENODEV;
+
 	/*
 	 * Probe XenBus here in the XS_PV case, and also XS_HVM unless we
 	 * need to wait for the platform PCI device to come up or
@@ -1009,8 +1012,8 @@ static int __init xenbus_init(void)
 #endif
 			xen_store_gfn = (unsigned long)v;
 			xen_store_interface =
-				xen_remap(xen_store_gfn << XEN_PAGE_SHIFT,
-					  XEN_PAGE_SIZE);
+				memremap(xen_store_gfn << XEN_PAGE_SHIFT,
+					 XEN_PAGE_SIZE, MEMREMAP_WB);
 			if (xen_store_interface->connection != XENSTORE_CONNECTED)
 				wait = true;
 		}
@@ -1022,7 +1025,7 @@ static int __init xenbus_init(void)
 			if (err < 0) {
 				pr_err("xenstore_late_init couldn't bind irq err=%d\n",
 				       err);
-				return err;
+				goto out_error;
 			}
 
 			xs_init_irq = err;

@@ -6,7 +6,7 @@
  *
  * Copyright 2009	Johannes Berg <johannes@sipsolutions.net>
  * Copyright 2013-2014  Intel Mobile Communications GmbH
- * Copyright 2018-2022	Intel Corporation
+ * Copyright 2018-2023	Intel Corporation
  */
 
 #include <linux/export.h>
@@ -666,19 +666,27 @@ bool cfg80211_chandef_dfs_usable(struct wiphy *wiphy,
 
 	return (r1 + r2 > 0);
 }
+EXPORT_SYMBOL(cfg80211_chandef_dfs_usable);
 
 /*
  * Checks if center frequency of chan falls with in the bandwidth
  * range of chandef.
  */
 bool cfg80211_is_sub_chan(struct cfg80211_chan_def *chandef,
-			  struct ieee80211_channel *chan)
+			  struct ieee80211_channel *chan,
+			  bool primary_only)
 {
 	int width;
 	u32 freq;
 
+	if (!chandef->chan)
+		return false;
+
 	if (chandef->chan->center_freq == chan->center_freq)
 		return true;
+
+	if (primary_only)
+		return false;
 
 	width = cfg80211_chandef_get_width(chandef);
 	if (width <= 20)
@@ -704,23 +712,25 @@ bool cfg80211_is_sub_chan(struct cfg80211_chan_def *chandef,
 
 bool cfg80211_beaconing_iface_active(struct wireless_dev *wdev)
 {
-	bool active = false;
+	unsigned int link;
 
-	ASSERT_WDEV_LOCK(wdev);
-
-	if (!wdev->chandef.chan)
-		return false;
+	lockdep_assert_wiphy(wdev->wiphy);
 
 	switch (wdev->iftype) {
 	case NL80211_IFTYPE_AP:
 	case NL80211_IFTYPE_P2P_GO:
-		active = wdev->beacon_interval != 0;
+		for_each_valid_link(wdev, link) {
+			if (wdev->links[link].ap.beacon_interval)
+				return true;
+		}
 		break;
 	case NL80211_IFTYPE_ADHOC:
-		active = wdev->ssid_len != 0;
+		if (wdev->u.ibss.ssid_len)
+			return true;
 		break;
 	case NL80211_IFTYPE_MESH_POINT:
-		active = wdev->mesh_id_len != 0;
+		if (wdev->u.mesh.id_len)
+			return true;
 		break;
 	case NL80211_IFTYPE_STATION:
 	case NL80211_IFTYPE_OCB:
@@ -737,7 +747,35 @@ bool cfg80211_beaconing_iface_active(struct wireless_dev *wdev)
 		WARN_ON(1);
 	}
 
-	return active;
+	return false;
+}
+
+bool cfg80211_wdev_on_sub_chan(struct wireless_dev *wdev,
+			       struct ieee80211_channel *chan,
+			       bool primary_only)
+{
+	unsigned int link;
+
+	switch (wdev->iftype) {
+	case NL80211_IFTYPE_AP:
+	case NL80211_IFTYPE_P2P_GO:
+		for_each_valid_link(wdev, link) {
+			if (cfg80211_is_sub_chan(&wdev->links[link].ap.chandef,
+						 chan, primary_only))
+				return true;
+		}
+		break;
+	case NL80211_IFTYPE_ADHOC:
+		return cfg80211_is_sub_chan(&wdev->u.ibss.chandef, chan,
+					    primary_only);
+	case NL80211_IFTYPE_MESH_POINT:
+		return cfg80211_is_sub_chan(&wdev->u.mesh.chandef, chan,
+					    primary_only);
+	default:
+		break;
+	}
+
+	return false;
 }
 
 static bool cfg80211_is_wiphy_oper_chan(struct wiphy *wiphy,
@@ -745,18 +783,14 @@ static bool cfg80211_is_wiphy_oper_chan(struct wiphy *wiphy,
 {
 	struct wireless_dev *wdev;
 
-	list_for_each_entry(wdev, &wiphy->wdev_list, list) {
-		wdev_lock(wdev);
-		if (!cfg80211_beaconing_iface_active(wdev)) {
-			wdev_unlock(wdev);
-			continue;
-		}
+	lockdep_assert_wiphy(wiphy);
 
-		if (cfg80211_is_sub_chan(&wdev->chandef, chan)) {
-			wdev_unlock(wdev);
+	list_for_each_entry(wdev, &wiphy->wdev_list, list) {
+		if (!cfg80211_beaconing_iface_active(wdev))
+			continue;
+
+		if (cfg80211_wdev_on_sub_chan(wdev, chan, false))
 			return true;
-		}
-		wdev_unlock(wdev);
 	}
 
 	return false;
@@ -772,7 +806,8 @@ cfg80211_offchan_chain_is_active(struct cfg80211_registered_device *rdev,
 	if (!cfg80211_chandef_valid(&rdev->background_radar_chandef))
 		return false;
 
-	return cfg80211_is_sub_chan(&rdev->background_radar_chandef, channel);
+	return cfg80211_is_sub_chan(&rdev->background_radar_chandef, channel,
+				    false);
 }
 
 bool cfg80211_any_wiphy_oper_chan(struct wiphy *wiphy,
@@ -785,14 +820,18 @@ bool cfg80211_any_wiphy_oper_chan(struct wiphy *wiphy,
 	if (!(chan->flags & IEEE80211_CHAN_RADAR))
 		return false;
 
-	list_for_each_entry(rdev, &cfg80211_rdev_list, list) {
+	for_each_rdev(rdev) {
+		bool found;
+
 		if (!reg_dfs_domain_same(wiphy, &rdev->wiphy))
 			continue;
 
-		if (cfg80211_is_wiphy_oper_chan(&rdev->wiphy, chan))
-			return true;
+		wiphy_lock(&rdev->wiphy);
+		found = cfg80211_is_wiphy_oper_chan(&rdev->wiphy, chan) ||
+			cfg80211_offchan_chain_is_active(rdev, chan);
+		wiphy_unlock(&rdev->wiphy);
 
-		if (cfg80211_offchan_chain_is_active(rdev, chan))
+		if (found)
 			return true;
 	}
 
@@ -927,6 +966,7 @@ cfg80211_chandef_dfs_cac_time(struct wiphy *wiphy,
 
 	return max(t1, t2);
 }
+EXPORT_SYMBOL(cfg80211_chandef_dfs_cac_time);
 
 static bool cfg80211_secondary_chans_ok(struct wiphy *wiphy,
 					u32 center_freq, u32 bandwidth,
@@ -1124,8 +1164,7 @@ bool cfg80211_chandef_usable(struct wiphy *wiphy,
 		if (!sband)
 			return false;
 
-		for (i = 0; i < sband->n_iftype_data; i++) {
-			iftd = &sband->iftype_data[i];
+		for_each_sband_iftype_data(sband, i, iftd) {
 			if (!iftd->eht_cap.has_eht)
 				continue;
 
@@ -1176,6 +1215,68 @@ bool cfg80211_chandef_usable(struct wiphy *wiphy,
 }
 EXPORT_SYMBOL(cfg80211_chandef_usable);
 
+static bool cfg80211_ir_permissive_check_wdev(enum nl80211_iftype iftype,
+					      struct wireless_dev *wdev,
+					      struct ieee80211_channel *chan)
+{
+	struct ieee80211_channel *other_chan = NULL;
+	unsigned int link_id;
+	int r1, r2;
+
+	for_each_valid_link(wdev, link_id) {
+		if (wdev->iftype == NL80211_IFTYPE_STATION &&
+		    wdev->links[link_id].client.current_bss)
+			other_chan = wdev->links[link_id].client.current_bss->pub.channel;
+
+		/*
+		 * If a GO already operates on the same GO_CONCURRENT channel,
+		 * this one (maybe the same one) can beacon as well. We allow
+		 * the operation even if the station we relied on with
+		 * GO_CONCURRENT is disconnected now. But then we must make sure
+		 * we're not outdoor on an indoor-only channel.
+		 */
+		if (iftype == NL80211_IFTYPE_P2P_GO &&
+		    wdev->iftype == NL80211_IFTYPE_P2P_GO &&
+		    wdev->links[link_id].ap.beacon_interval &&
+		    !(chan->flags & IEEE80211_CHAN_INDOOR_ONLY))
+			other_chan = wdev->links[link_id].ap.chandef.chan;
+
+		if (!other_chan)
+			continue;
+
+		if (chan == other_chan)
+			return true;
+
+		if (chan->band != NL80211_BAND_5GHZ &&
+		    chan->band != NL80211_BAND_6GHZ)
+			continue;
+
+		r1 = cfg80211_get_unii(chan->center_freq);
+		r2 = cfg80211_get_unii(other_chan->center_freq);
+
+		if (r1 != -EINVAL && r1 == r2) {
+			/*
+			 * At some locations channels 149-165 are considered a
+			 * bundle, but at other locations, e.g., Indonesia,
+			 * channels 149-161 are considered a bundle while
+			 * channel 165 is left out and considered to be in a
+			 * different bundle. Thus, in case that there is a
+			 * station interface connected to an AP on channel 165,
+			 * it is assumed that channels 149-161 are allowed for
+			 * GO operations. However, having a station interface
+			 * connected to an AP on channels 149-161, does not
+			 * allow GO operation on channel 165.
+			 */
+			if (chan->center_freq == 5825 &&
+			    other_chan->center_freq != 5825)
+				continue;
+			return true;
+		}
+	}
+
+	return false;
+}
+
 /*
  * Check if the channel can be used under permissive conditions mandated by
  * some regulatory bodies, i.e., the channel is marked with
@@ -1219,59 +1320,11 @@ static bool cfg80211_ir_permissive_chan(struct wiphy *wiphy,
 	 * the current registered device.
 	 */
 	list_for_each_entry(wdev, &rdev->wiphy.wdev_list, list) {
-		struct ieee80211_channel *other_chan = NULL;
-		int r1, r2;
+		bool ret;
 
-		wdev_lock(wdev);
-		if (wdev->iftype == NL80211_IFTYPE_STATION &&
-		    wdev->current_bss)
-			other_chan = wdev->current_bss->pub.channel;
-
-		/*
-		 * If a GO already operates on the same GO_CONCURRENT channel,
-		 * this one (maybe the same one) can beacon as well. We allow
-		 * the operation even if the station we relied on with
-		 * GO_CONCURRENT is disconnected now. But then we must make sure
-		 * we're not outdoor on an indoor-only channel.
-		 */
-		if (iftype == NL80211_IFTYPE_P2P_GO &&
-		    wdev->iftype == NL80211_IFTYPE_P2P_GO &&
-		    wdev->beacon_interval &&
-		    !(chan->flags & IEEE80211_CHAN_INDOOR_ONLY))
-			other_chan = wdev->chandef.chan;
-		wdev_unlock(wdev);
-
-		if (!other_chan)
-			continue;
-
-		if (chan == other_chan)
-			return true;
-
-		if (chan->band != NL80211_BAND_5GHZ &&
-		    chan->band != NL80211_BAND_6GHZ)
-			continue;
-
-		r1 = cfg80211_get_unii(chan->center_freq);
-		r2 = cfg80211_get_unii(other_chan->center_freq);
-
-		if (r1 != -EINVAL && r1 == r2) {
-			/*
-			 * At some locations channels 149-165 are considered a
-			 * bundle, but at other locations, e.g., Indonesia,
-			 * channels 149-161 are considered a bundle while
-			 * channel 165 is left out and considered to be in a
-			 * different bundle. Thus, in case that there is a
-			 * station interface connected to an AP on channel 165,
-			 * it is assumed that channels 149-161 are allowed for
-			 * GO operations. However, having a station interface
-			 * connected to an AP on channels 149-161, does not
-			 * allow GO operation on channel 165.
-			 */
-			if (chan->center_freq == 5825 &&
-			    other_chan->center_freq != 5825)
-				continue;
-			return true;
-		}
+		ret = cfg80211_ir_permissive_check_wdev(iftype, wdev, chan);
+		if (ret)
+			return ret;
 	}
 
 	return false;
@@ -1374,3 +1427,96 @@ bool cfg80211_any_usable_channels(struct wiphy *wiphy,
 	return false;
 }
 EXPORT_SYMBOL(cfg80211_any_usable_channels);
+
+struct cfg80211_chan_def *wdev_chandef(struct wireless_dev *wdev,
+				       unsigned int link_id)
+{
+	lockdep_assert_wiphy(wdev->wiphy);
+
+	WARN_ON(wdev->valid_links && !(wdev->valid_links & BIT(link_id)));
+	WARN_ON(!wdev->valid_links && link_id > 0);
+
+	switch (wdev->iftype) {
+	case NL80211_IFTYPE_MESH_POINT:
+		return &wdev->u.mesh.chandef;
+	case NL80211_IFTYPE_ADHOC:
+		return &wdev->u.ibss.chandef;
+	case NL80211_IFTYPE_OCB:
+		return &wdev->u.ocb.chandef;
+	case NL80211_IFTYPE_AP:
+	case NL80211_IFTYPE_P2P_GO:
+		return &wdev->links[link_id].ap.chandef;
+	default:
+		return NULL;
+	}
+}
+EXPORT_SYMBOL(wdev_chandef);
+
+struct cfg80211_per_bw_puncturing_values {
+	u8 len;
+	const u16 *valid_values;
+};
+
+static const u16 puncturing_values_80mhz[] = {
+	0x8, 0x4, 0x2, 0x1
+};
+
+static const u16 puncturing_values_160mhz[] = {
+	 0x80, 0x40, 0x20, 0x10, 0x8, 0x4, 0x2, 0x1, 0xc0, 0x30, 0xc, 0x3
+};
+
+static const u16 puncturing_values_320mhz[] = {
+	0xc000, 0x3000, 0xc00, 0x300, 0xc0, 0x30, 0xc, 0x3, 0xf000, 0xf00,
+	0xf0, 0xf, 0xfc00, 0xf300, 0xf0c0, 0xf030, 0xf00c, 0xf003, 0xc00f,
+	0x300f, 0xc0f, 0x30f, 0xcf, 0x3f
+};
+
+#define CFG80211_PER_BW_VALID_PUNCTURING_VALUES(_bw) \
+	{ \
+		.len = ARRAY_SIZE(puncturing_values_ ## _bw ## mhz), \
+		.valid_values = puncturing_values_ ## _bw ## mhz \
+	}
+
+static const struct cfg80211_per_bw_puncturing_values per_bw_puncturing[] = {
+	CFG80211_PER_BW_VALID_PUNCTURING_VALUES(80),
+	CFG80211_PER_BW_VALID_PUNCTURING_VALUES(160),
+	CFG80211_PER_BW_VALID_PUNCTURING_VALUES(320)
+};
+
+bool cfg80211_valid_disable_subchannel_bitmap(u16 *bitmap,
+					      const struct cfg80211_chan_def *chandef)
+{
+	u32 idx, i, start_freq;
+
+	switch (chandef->width) {
+	case NL80211_CHAN_WIDTH_80:
+		idx = 0;
+		start_freq = chandef->center_freq1 - 40;
+		break;
+	case NL80211_CHAN_WIDTH_160:
+		idx = 1;
+		start_freq = chandef->center_freq1 - 80;
+		break;
+	case NL80211_CHAN_WIDTH_320:
+		idx = 2;
+		start_freq = chandef->center_freq1 - 160;
+		break;
+	default:
+		*bitmap = 0;
+		break;
+	}
+
+	if (!*bitmap)
+		return true;
+
+	/* check if primary channel is punctured */
+	if (*bitmap & (u16)BIT((chandef->chan->center_freq - start_freq) / 20))
+		return false;
+
+	for (i = 0; i < per_bw_puncturing[idx].len; i++)
+		if (per_bw_puncturing[idx].valid_values[i] == *bitmap)
+			return true;
+
+	return false;
+}
+EXPORT_SYMBOL(cfg80211_valid_disable_subchannel_bitmap);

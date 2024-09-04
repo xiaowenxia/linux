@@ -153,7 +153,7 @@ void synproxy_init_timestamp_cookie(const struct nf_synproxy_info *info,
 				    struct synproxy_options *opts)
 {
 	opts->tsecr = opts->tsval;
-	opts->tsval = tcp_time_stamp_raw() & ~0x3f;
+	opts->tsval = tcp_clock_ms() & ~0x3f;
 
 	if (opts->options & NF_SYNPROXY_OPT_WSCALE) {
 		opts->tsval |= opts->wscale;
@@ -405,7 +405,7 @@ synproxy_build_ip(struct net *net, struct sk_buff *skb, __be32 saddr,
 	iph->tos	= 0;
 	iph->id		= 0;
 	iph->frag_off	= htons(IP_DF);
-	iph->ttl	= net->ipv4.sysctl_ip_default_ttl;
+	iph->ttl	= READ_ONCE(net->ipv4.sysctl_ip_default_ttl);
 	iph->protocol	= IPPROTO_TCP;
 	iph->check	= 0;
 	iph->saddr	= saddr;

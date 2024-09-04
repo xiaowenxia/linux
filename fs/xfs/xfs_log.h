@@ -9,7 +9,8 @@
 struct xfs_cil_ctx;
 
 struct xfs_log_vec {
-	struct xfs_log_vec	*lv_next;	/* next lv in build list */
+	struct list_head	lv_list;	/* CIL lv chain ptrs */
+	uint32_t		lv_order_id;	/* chain ordering info */
 	int			lv_niovecs;	/* number of iovecs in lv */
 	struct xfs_log_iovec	*lv_iovecp;	/* iovec array */
 	struct xfs_log_item	*lv_item;	/* owner */
@@ -84,6 +85,13 @@ xlog_copy_iovec(struct xfs_log_vec *lv, struct xfs_log_iovec **vecp,
 	memcpy(buf, data, len);
 	xlog_finish_iovec(lv, *vecp, len);
 	return buf;
+}
+
+static inline void *
+xlog_copy_from_iovec(struct xfs_log_vec *lv, struct xfs_log_iovec **vecp,
+		const struct xfs_log_iovec *src)
+{
+	return xlog_copy_iovec(lv, vecp, src->i_type, src->i_addr, src->i_len);
 }
 
 /*

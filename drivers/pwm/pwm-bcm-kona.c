@@ -1,15 +1,5 @@
-/*
- * Copyright (C) 2014 Broadcom Corporation
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License as
- * published by the Free Software Foundation version 2.
- *
- * This program is distributed "as is" WITHOUT ANY WARRANTY of any
- * kind, whether express or implied; without even the implied warranty
- * of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- */
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 2014 Broadcom Corporation
 
 #include <linux/clk.h>
 #include <linux/delay.h>
@@ -71,9 +61,9 @@ struct kona_pwmc {
 	struct clk *clk;
 };
 
-static inline struct kona_pwmc *to_kona_pwmc(struct pwm_chip *_chip)
+static inline struct kona_pwmc *to_kona_pwmc(struct pwm_chip *chip)
 {
-	return container_of(_chip, struct kona_pwmc, chip);
+	return container_of(chip, struct kona_pwmc, chip);
 }
 
 /*
@@ -279,7 +269,6 @@ static int kona_pwmc_apply(struct pwm_chip *chip, struct pwm_device *pwm,
 
 static const struct pwm_ops kona_pwm_ops = {
 	.apply = kona_pwmc_apply,
-	.owner = THIS_MODULE,
 };
 
 static int kona_pwmc_probe(struct platform_device *pdev)

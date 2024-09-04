@@ -11,10 +11,12 @@
 #include <linux/syscalls.h>
 #include <linux/utime.h>
 #include <linux/file.h>
+#include <linux/kstrtox.h>
 #include <linux/memblock.h>
 #include <linux/mm.h>
 #include <linux/namei.h>
 #include <linux/init_syscalls.h>
+#include <linux/task_work.h>
 #include <linux/umh.h>
 
 static __initdata bool csum_present;
@@ -58,15 +60,8 @@ static void __init error(char *x)
 		message = x;
 }
 
-static void panic_show_mem(const char *fmt, ...)
-{
-	va_list args;
-
-	show_mem(0, NULL);
-	va_start(args, fmt);
-	panic(fmt, args);
-	va_end(args);
-}
+#define panic_show_mem(fmt, ...) \
+	({ show_mem(); panic(fmt, ##__VA_ARGS__); })
 
 /* link hash */
 
@@ -460,7 +455,7 @@ static long __init write_buffer(char *buf, unsigned long len)
 
 static long __init flush_buffer(void *bufv, unsigned long len)
 {
-	char *buf = (char *) bufv;
+	char *buf = bufv;
 	long written;
 	long origLen = len;
 	if (message)
@@ -481,7 +476,7 @@ static long __init flush_buffer(void *bufv, unsigned long len)
 	return origLen;
 }
 
-static unsigned long my_inptr; /* index of next byte to be processed in inbuf */
+static unsigned long my_inptr __initdata; /* index of next byte to be processed in inbuf */
 
 #include <linux/decompress/generic.h>
 
@@ -570,8 +565,7 @@ __setup("keepinitrd", keepinitrd_setup);
 static bool __initdata initramfs_async = true;
 static int __init initramfs_async_setup(char *str)
 {
-	strtobool(str, &initramfs_async);
-	return 1;
+	return kstrtobool(str, &initramfs_async) == 0;
 }
 __setup("initramfs_async=", initramfs_async_setup);
 
@@ -727,6 +721,7 @@ done:
 	initrd_end = 0;
 
 	flush_delayed_fput();
+	task_work_run();
 }
 
 static ASYNC_DOMAIN_EXCLUSIVE(initramfs_domain);

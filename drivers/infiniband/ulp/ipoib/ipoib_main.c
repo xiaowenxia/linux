@@ -742,7 +742,7 @@ void ipoib_flush_paths(struct net_device *dev)
 
 static void path_rec_completion(int status,
 				struct sa_path_rec *pathrec,
-				void *path_ptr)
+				unsigned int num_prs, void *path_ptr)
 {
 	struct ipoib_path *path = path_ptr;
 	struct net_device *dev = path->dev;
@@ -1664,8 +1664,10 @@ static void ipoib_napi_add(struct net_device *dev)
 {
 	struct ipoib_dev_priv *priv = ipoib_priv(dev);
 
-	netif_napi_add(dev, &priv->recv_napi, ipoib_rx_poll, IPOIB_NUM_WC);
-	netif_napi_add(dev, &priv->send_napi, ipoib_tx_poll, MAX_SEND_CQE);
+	netif_napi_add_weight(dev, &priv->recv_napi, ipoib_rx_poll,
+			      IPOIB_NUM_WC);
+	netif_napi_add_weight(dev, &priv->send_napi, ipoib_tx_poll,
+			      MAX_SEND_CQE);
 }
 
 static void ipoib_napi_del(struct net_device *dev)
@@ -2003,8 +2005,7 @@ static void ipoib_ndo_uninit(struct net_device *dev)
 		priv->wq = NULL;
 	}
 
-	if (priv->parent)
-		dev_put(priv->parent);
+	dev_put(priv->parent);
 }
 
 static int ipoib_set_vf_link_state(struct net_device *dev, int vf, int link_state)
@@ -2198,6 +2199,14 @@ int ipoib_intf_init(struct ib_device *hca, u32 port, const char *name,
 		rn->attach_mcast = ipoib_mcast_attach;
 		rn->detach_mcast = ipoib_mcast_detach;
 		rn->hca = hca;
+
+		rc = netif_set_real_num_tx_queues(dev, 1);
+		if (rc)
+			goto out;
+
+		rc = netif_set_real_num_rx_queues(dev, 1);
+		if (rc)
+			goto out;
 	}
 
 	priv->rn_ops = dev->netdev_ops;

@@ -816,9 +816,9 @@ static void neo_parse_isr(struct jsm_board *brd, u32 port)
 		/* Parse any modem signal changes */
 		jsm_dbg(INTR, &ch->ch_bd->pci_dev,
 			"MOD_STAT: sending to parse_modem_sigs\n");
-		spin_lock_irqsave(&ch->uart_port.lock, lock_flags);
+		uart_port_lock_irqsave(&ch->uart_port, &lock_flags);
 		neo_parse_modem(ch, readb(&ch->ch_neo_uart->msr));
-		spin_unlock_irqrestore(&ch->uart_port.lock, lock_flags);
+		uart_port_unlock_irqrestore(&ch->uart_port, lock_flags);
 	}
 }
 
@@ -938,7 +938,7 @@ static void neo_param(struct jsm_channel *ch)
 	/*
 	 * If baud rate is zero, flush queues, and set mval to drop DTR.
 	 */
-	if ((ch->ch_c_cflag & (CBAUD)) == 0) {
+	if ((ch->ch_c_cflag & CBAUD) == B0) {
 		ch->ch_r_head = ch->ch_r_tail = 0;
 		ch->ch_e_head = ch->ch_e_tail = 0;
 
@@ -997,14 +997,8 @@ static void neo_param(struct jsm_channel *ch)
 	if (!(ch->ch_c_cflag & PARODD))
 		lcr |= UART_LCR_EPAR;
 
-	/*
-	 * Not all platforms support mark/space parity,
-	 * so this will hide behind an ifdef.
-	 */
-#ifdef CMSPAR
 	if (ch->ch_c_cflag & CMSPAR)
 		lcr |= UART_LCR_SPAR;
-#endif
 
 	if (ch->ch_c_cflag & CSTOPB)
 		lcr |= UART_LCR_STOP;

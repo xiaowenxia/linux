@@ -5,6 +5,7 @@
  * Copyright (C) 2013 Cogent Embedded, Inc.
  * Copyright (C) 2013 Renesas Solutions Corp.
  */
+#include <linux/mod_devicetable.h>
 #include <linux/module.h>
 #include <linux/init.h>
 #include <linux/errno.h>
@@ -43,6 +44,7 @@
 #define ADV7180_INPUT_CONTROL_INSEL_MASK		0x0f
 
 #define ADV7182_REG_INPUT_VIDSEL			0x0002
+#define ADV7182_REG_INPUT_RESERVED			BIT(2)
 
 #define ADV7180_REG_OUTPUT_CONTROL			0x0003
 #define ADV7180_REG_EXTENDED_OUTPUT_CONTROL		0x0004
@@ -1060,7 +1062,9 @@ static int adv7182_init(struct adv7180_state *state)
 
 static int adv7182_set_std(struct adv7180_state *state, unsigned int std)
 {
-	return adv7180_write(state, ADV7182_REG_INPUT_VIDSEL, std << 4);
+	/* Failing to set the reserved bit can result in increased video noise */
+	return adv7180_write(state, ADV7182_REG_INPUT_VIDSEL,
+			     (std << 4) | ADV7182_REG_INPUT_RESERVED);
 }
 
 enum adv7182_input_type {
@@ -1390,8 +1394,7 @@ out_unlock:
 	return ret;
 }
 
-static int adv7180_probe(struct i2c_client *client,
-			 const struct i2c_device_id *id)
+static int adv7180_probe(struct i2c_client *client)
 {
 	struct device_node *np = client->dev.of_node;
 	struct adv7180_state *state;
@@ -1408,7 +1411,7 @@ static int adv7180_probe(struct i2c_client *client,
 
 	state->client = client;
 	state->field = V4L2_FIELD_ALTERNATE;
-	state->chip_info = (struct adv7180_chip_info *)id->driver_data;
+	state->chip_info = i2c_get_match_data(client);
 
 	state->pwdn_gpio = devm_gpiod_get_optional(&client->dev, "powerdown",
 						   GPIOD_OUT_HIGH);
@@ -1511,7 +1514,7 @@ err_unregister_csi_client:
 	return ret;
 }
 
-static int adv7180_remove(struct i2c_client *client)
+static void adv7180_remove(struct i2c_client *client)
 {
 	struct v4l2_subdev *sd = i2c_get_clientdata(client);
 	struct adv7180_state *state = to_state(sd);
@@ -1531,25 +1534,7 @@ static int adv7180_remove(struct i2c_client *client)
 	adv7180_set_power_pin(state, false);
 
 	mutex_destroy(&state->mutex);
-
-	return 0;
 }
-
-static const struct i2c_device_id adv7180_id[] = {
-	{ "adv7180", (kernel_ulong_t)&adv7180_info },
-	{ "adv7180cp", (kernel_ulong_t)&adv7180_info },
-	{ "adv7180st", (kernel_ulong_t)&adv7180_info },
-	{ "adv7182", (kernel_ulong_t)&adv7182_info },
-	{ "adv7280", (kernel_ulong_t)&adv7280_info },
-	{ "adv7280-m", (kernel_ulong_t)&adv7280_m_info },
-	{ "adv7281", (kernel_ulong_t)&adv7281_info },
-	{ "adv7281-m", (kernel_ulong_t)&adv7281_m_info },
-	{ "adv7281-ma", (kernel_ulong_t)&adv7281_ma_info },
-	{ "adv7282", (kernel_ulong_t)&adv7282_info },
-	{ "adv7282-m", (kernel_ulong_t)&adv7282_m_info },
-	{},
-};
-MODULE_DEVICE_TABLE(i2c, adv7180_id);
 
 #ifdef CONFIG_PM_SLEEP
 static int adv7180_suspend(struct device *dev)
@@ -1584,30 +1569,43 @@ static SIMPLE_DEV_PM_OPS(adv7180_pm_ops, adv7180_suspend, adv7180_resume);
 #define ADV7180_PM_OPS NULL
 #endif
 
-#ifdef CONFIG_OF
-static const struct of_device_id adv7180_of_id[] = {
-	{ .compatible = "adi,adv7180", },
-	{ .compatible = "adi,adv7180cp", },
-	{ .compatible = "adi,adv7180st", },
-	{ .compatible = "adi,adv7182", },
-	{ .compatible = "adi,adv7280", },
-	{ .compatible = "adi,adv7280-m", },
-	{ .compatible = "adi,adv7281", },
-	{ .compatible = "adi,adv7281-m", },
-	{ .compatible = "adi,adv7281-ma", },
-	{ .compatible = "adi,adv7282", },
-	{ .compatible = "adi,adv7282-m", },
-	{ },
+static const struct i2c_device_id adv7180_id[] = {
+	{ "adv7180", (kernel_ulong_t)&adv7180_info },
+	{ "adv7180cp", (kernel_ulong_t)&adv7180_info },
+	{ "adv7180st", (kernel_ulong_t)&adv7180_info },
+	{ "adv7182", (kernel_ulong_t)&adv7182_info },
+	{ "adv7280", (kernel_ulong_t)&adv7280_info },
+	{ "adv7280-m", (kernel_ulong_t)&adv7280_m_info },
+	{ "adv7281", (kernel_ulong_t)&adv7281_info },
+	{ "adv7281-m", (kernel_ulong_t)&adv7281_m_info },
+	{ "adv7281-ma", (kernel_ulong_t)&adv7281_ma_info },
+	{ "adv7282", (kernel_ulong_t)&adv7282_info },
+	{ "adv7282-m", (kernel_ulong_t)&adv7282_m_info },
+	{}
 };
+MODULE_DEVICE_TABLE(i2c, adv7180_id);
 
+static const struct of_device_id adv7180_of_id[] = {
+	{ .compatible = "adi,adv7180", &adv7180_info },
+	{ .compatible = "adi,adv7180cp", &adv7180_info },
+	{ .compatible = "adi,adv7180st", &adv7180_info },
+	{ .compatible = "adi,adv7182", &adv7182_info },
+	{ .compatible = "adi,adv7280", &adv7280_info },
+	{ .compatible = "adi,adv7280-m", &adv7280_m_info },
+	{ .compatible = "adi,adv7281", &adv7281_info },
+	{ .compatible = "adi,adv7281-m", &adv7281_m_info },
+	{ .compatible = "adi,adv7281-ma", &adv7281_ma_info },
+	{ .compatible = "adi,adv7282", &adv7282_info },
+	{ .compatible = "adi,adv7282-m", &adv7282_m_info },
+	{}
+};
 MODULE_DEVICE_TABLE(of, adv7180_of_id);
-#endif
 
 static struct i2c_driver adv7180_driver = {
 	.driver = {
 		   .name = KBUILD_MODNAME,
 		   .pm = ADV7180_PM_OPS,
-		   .of_match_table = of_match_ptr(adv7180_of_id),
+		   .of_match_table = adv7180_of_id,
 		   },
 	.probe = adv7180_probe,
 	.remove = adv7180_remove,

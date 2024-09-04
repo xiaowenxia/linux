@@ -47,9 +47,9 @@ user_service_free(void *userdata)
 
 static void close_delivered(struct user_service *user_service)
 {
-	vchiq_log_info(vchiq_arm_log_level,
-		       "%s(handle=%x)",
-		       __func__, user_service->service->handle);
+	vchiq_log_debug(user_service->service->state->dev, VCHIQ_ARM,
+			"%s(handle=%x)",
+			__func__, user_service->service->handle);
 
 	if (user_service->close_pending) {
 		/* Allow the underlying service to be culled */
@@ -108,11 +108,11 @@ static ssize_t vchiq_ioc_copy_element_data(void *context, void *dest,
 }
 
 static int
-vchiq_ioc_queue_message(unsigned int handle, struct vchiq_element *elements,
-			unsigned long count)
+vchiq_ioc_queue_message(struct vchiq_instance *instance, unsigned int handle,
+			struct vchiq_element *elements, unsigned long count)
 {
 	struct vchiq_io_copy_callback_context context;
-	enum vchiq_status status = VCHIQ_SUCCESS;
+	int status = 0;
 	unsigned long i;
 	size_t total_size = 0;
 
@@ -127,12 +127,12 @@ vchiq_ioc_queue_message(unsigned int handle, struct vchiq_element *elements,
 		total_size += elements[i].size;
 	}
 
-	status = vchiq_queue_message(handle, vchiq_ioc_copy_element_data,
+	status = vchiq_queue_message(instance, handle, vchiq_ioc_copy_element_data,
 				     &context, total_size);
 
-	if (status == VCHIQ_ERROR)
+	if (status == -EINVAL)
 		return -EIO;
-	else if (status == VCHIQ_RETRY)
+	else if (status == -EAGAIN)
 		return -EINTR;
 	return 0;
 }
@@ -142,7 +142,7 @@ static int vchiq_ioc_create_service(struct vchiq_instance *instance,
 {
 	struct user_service *user_service = NULL;
 	struct vchiq_service *service;
-	enum vchiq_status status = VCHIQ_SUCCESS;
+	int status = 0;
 	struct vchiq_service_params_kernel params;
 	int srvstate;
 
@@ -190,9 +190,9 @@ static int vchiq_ioc_create_service(struct vchiq_instance *instance,
 
 	if (args->is_open) {
 		status = vchiq_open_service_internal(service, instance->pid);
-		if (status != VCHIQ_SUCCESS) {
-			vchiq_remove_service(service->handle);
-			return (status == VCHIQ_RETRY) ?
+		if (status) {
+			vchiq_remove_service(instance, service->handle);
+			return (status == -EAGAIN) ?
 				-EINTR : -EIO;
 		}
 	}
@@ -235,8 +235,8 @@ static int vchiq_ioc_dequeue_message(struct vchiq_instance *instance,
 			spin_unlock(&msg_queue_spinlock);
 			DEBUG_TRACE(DEQUEUE_MESSAGE_LINE);
 			if (wait_for_completion_interruptible(&user_service->insert_event)) {
-				vchiq_log_info(vchiq_arm_log_level,
-					       "DEQUEUE_MESSAGE interrupted");
+				vchiq_log_debug(service->state->dev, VCHIQ_ARM,
+						"DEQUEUE_MESSAGE interrupted");
 				ret = -EINTR;
 				break;
 			}
@@ -266,12 +266,12 @@ static int vchiq_ioc_dequeue_message(struct vchiq_instance *instance,
 		/* Copy to user space if msgbuf is not NULL */
 		if (!args->buf || (copy_to_user(args->buf, header->data, header->size) == 0)) {
 			ret = header->size;
-			vchiq_release_message(service->handle, header);
+			vchiq_release_message(instance, service->handle, header);
 		} else {
 			ret = -EFAULT;
 		}
 	} else {
-		vchiq_log_error(vchiq_arm_log_level,
+		vchiq_log_error(service->state->dev, VCHIQ_ARM,
 				"header %pK: bufsize %x < size %x",
 				header, args->bufsize, header->size);
 		WARN(1, "invalid size\n");
@@ -289,8 +289,7 @@ static int vchiq_irq_queue_bulk_tx_rx(struct vchiq_instance *instance,
 				      enum vchiq_bulk_mode __user *mode)
 {
 	struct vchiq_service *service;
-	struct bulk_waiter_node *waiter = NULL;
-	bool found = false;
+	struct bulk_waiter_node *waiter = NULL, *iter;
 	void *userdata;
 	int status = 0;
 	int ret;
@@ -309,29 +308,29 @@ static int vchiq_irq_queue_bulk_tx_rx(struct vchiq_instance *instance,
 		userdata = &waiter->bulk_waiter;
 	} else if (args->mode == VCHIQ_BULK_MODE_WAITING) {
 		mutex_lock(&instance->bulk_waiter_list_mutex);
-		list_for_each_entry(waiter, &instance->bulk_waiter_list,
+		list_for_each_entry(iter, &instance->bulk_waiter_list,
 				    list) {
-			if (waiter->pid == current->pid) {
-				list_del(&waiter->list);
-				found = true;
+			if (iter->pid == current->pid) {
+				list_del(&iter->list);
+				waiter = iter;
 				break;
 			}
 		}
 		mutex_unlock(&instance->bulk_waiter_list_mutex);
-		if (!found) {
-			vchiq_log_error(vchiq_arm_log_level,
+		if (!waiter) {
+			vchiq_log_error(service->state->dev, VCHIQ_ARM,
 					"no bulk_waiter found for pid %d", current->pid);
 			ret = -ESRCH;
 			goto out;
 		}
-		vchiq_log_info(vchiq_arm_log_level,
-			       "found bulk_waiter %pK for pid %d", waiter, current->pid);
+		vchiq_log_debug(service->state->dev, VCHIQ_ARM,
+				"found bulk_waiter %pK for pid %d", waiter, current->pid);
 		userdata = &waiter->bulk_waiter;
 	} else {
 		userdata = args->userdata;
 	}
 
-	status = vchiq_bulk_transfer(args->handle, NULL, args->data, args->size,
+	status = vchiq_bulk_transfer(instance, args->handle, NULL, args->data, args->size,
 				     userdata, args->mode, dir);
 
 	if (!waiter) {
@@ -339,7 +338,7 @@ static int vchiq_irq_queue_bulk_tx_rx(struct vchiq_instance *instance,
 		goto out;
 	}
 
-	if ((status != VCHIQ_RETRY) || fatal_signal_pending(current) ||
+	if ((status != -EAGAIN) || fatal_signal_pending(current) ||
 	    !waiter->bulk_waiter.bulk) {
 		if (waiter->bulk_waiter.bulk) {
 			/* Cancel the signal when the transfer completes. */
@@ -356,8 +355,8 @@ static int vchiq_irq_queue_bulk_tx_rx(struct vchiq_instance *instance,
 		mutex_lock(&instance->bulk_waiter_list_mutex);
 		list_add(&waiter->list, &instance->bulk_waiter_list);
 		mutex_unlock(&instance->bulk_waiter_list_mutex);
-		vchiq_log_info(vchiq_arm_log_level,
-			       "saved bulk_waiter %pK for pid %d", waiter, current->pid);
+		vchiq_log_debug(service->state->dev, VCHIQ_ARM,
+				"saved bulk_waiter %pK for pid %d", waiter, current->pid);
 
 		ret = put_user(mode_waiting, mode);
 	}
@@ -365,9 +364,9 @@ out:
 	vchiq_service_put(service);
 	if (ret)
 		return ret;
-	else if (status == VCHIQ_ERROR)
+	else if (status == -EINVAL)
 		return -EIO;
-	else if (status == VCHIQ_RETRY)
+	else if (status == -EAGAIN)
 		return -EINTR;
 	return 0;
 }
@@ -456,8 +455,8 @@ static int vchiq_ioc_await_completion(struct vchiq_instance *instance,
 		mutex_lock(&instance->completion_mutex);
 		if (rc) {
 			DEBUG_TRACE(AWAIT_COMPLETION_LINE);
-			vchiq_log_info(vchiq_arm_log_level,
-				       "AWAIT_COMPLETION interrupted");
+			vchiq_log_debug(instance->state->dev, VCHIQ_ARM,
+					"AWAIT_COMPLETION interrupted");
 			ret = -EINTR;
 			goto out;
 		}
@@ -502,7 +501,7 @@ static int vchiq_ioc_await_completion(struct vchiq_instance *instance,
 			msglen = header->size + sizeof(struct vchiq_header);
 			/* This must be a VCHIQ-style service */
 			if (args->msgbufsize < msglen) {
-				vchiq_log_error(vchiq_arm_log_level,
+				vchiq_log_error(service->state->dev, VCHIQ_ARM,
 						"header %pK: msgbufsize %x < msglen %x",
 						header, args->msgbufsize, msglen);
 						WARN(1, "invalid message size\n");
@@ -530,7 +529,7 @@ static int vchiq_ioc_await_completion(struct vchiq_instance *instance,
 			}
 
 			/* Now it has been copied, the message can be released. */
-			vchiq_release_message(service->handle, header);
+			vchiq_release_message(instance, service->handle, header);
 
 			/* The completion must point to the msgbuf. */
 			user_completion.header = msgbuf;
@@ -578,12 +577,12 @@ static long
 vchiq_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
 	struct vchiq_instance *instance = file->private_data;
-	enum vchiq_status status = VCHIQ_SUCCESS;
+	int status = 0;
 	struct vchiq_service *service = NULL;
 	long ret = 0;
 	int i, rc;
 
-	vchiq_log_trace(vchiq_arm_log_level,
+	vchiq_log_trace(instance->state->dev, VCHIQ_ARM,
 			"%s - instance %pK, cmd %s, arg %lx", __func__, instance,
 			((_IOC_TYPE(cmd) == VCHIQ_IOC_MAGIC) && (_IOC_NR(cmd) <= VCHIQ_IOC_MAX)) ?
 			ioctl_names[_IOC_NR(cmd)] : "<invalid>", arg);
@@ -597,14 +596,14 @@ vchiq_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		i = 0;
 		while ((service = next_service_by_instance(instance->state,
 							   instance, &i))) {
-			status = vchiq_remove_service(service->handle);
+			status = vchiq_remove_service(instance, service->handle);
 			vchiq_service_put(service);
-			if (status != VCHIQ_SUCCESS)
+			if (status)
 				break;
 		}
 		service = NULL;
 
-		if (status == VCHIQ_SUCCESS) {
+		if (!status) {
 			/* Wake the completion thread and ask it to exit */
 			instance->closing = 1;
 			complete(&instance->insert_event);
@@ -619,7 +618,7 @@ vchiq_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		}
 		rc = mutex_lock_killable(&instance->state->mutex);
 		if (rc) {
-			vchiq_log_error(vchiq_arm_log_level,
+			vchiq_log_error(instance->state->dev, VCHIQ_ARM,
 					"vchiq: connect: could not lock mutex for state %d: %d",
 					instance->state->id, rc);
 			ret = -EINTR;
@@ -628,10 +627,10 @@ vchiq_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		status = vchiq_connect_internal(instance->state, instance);
 		mutex_unlock(&instance->state->mutex);
 
-		if (status == VCHIQ_SUCCESS)
+		if (!status)
 			instance->connected = 1;
 		else
-			vchiq_log_error(vchiq_arm_log_level,
+			vchiq_log_error(instance->state->dev, VCHIQ_ARM,
 					"vchiq: could not connect: %d", status);
 		break;
 
@@ -650,7 +649,7 @@ vchiq_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			break;
 
 		if (put_user(args.handle, &argp->handle)) {
-			vchiq_remove_service(args.handle);
+			vchiq_remove_service(instance, args.handle);
 			ret = -EFAULT;
 		}
 	} break;
@@ -674,9 +673,9 @@ vchiq_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		 */
 		if (!user_service->close_pending) {
 			status = (cmd == VCHIQ_IOC_CLOSE_SERVICE) ?
-				 vchiq_close_service(service->handle) :
-				 vchiq_remove_service(service->handle);
-			if (status != VCHIQ_SUCCESS)
+				 vchiq_close_service(instance, service->handle) :
+				 vchiq_remove_service(instance, service->handle);
+			if (status)
 				break;
 		}
 
@@ -687,7 +686,7 @@ vchiq_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		 */
 		if (user_service->close_pending &&
 		    wait_for_completion_interruptible(&user_service->close_event))
-			status = VCHIQ_RETRY;
+			status = -EAGAIN;
 		break;
 	}
 
@@ -701,14 +700,13 @@ vchiq_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 				vchiq_use_service_internal(service) :
 				vchiq_release_service_internal(service);
 			if (ret) {
-				vchiq_log_error(vchiq_susp_log_level,
-						"%s: cmd %s returned error %ld for service %c%c%c%c:%03d",
+				vchiq_log_error(instance->state->dev, VCHIQ_SUSPEND,
+						"%s: cmd %s returned error %ld for service %p4cc:%03d",
 						__func__, (cmd == VCHIQ_IOC_USE_SERVICE) ?
 						"VCHIQ_IOC_USE_SERVICE" :
 						"VCHIQ_IOC_RELEASE_SERVICE",
-					ret,
-					VCHIQ_FOURCC_AS_4CHARS(service->base.fourcc),
-					service->client_id);
+						ret, &service->base.fourcc,
+						service->client_id);
 			}
 		} else {
 			ret = -EINVAL;
@@ -732,7 +730,7 @@ vchiq_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
 			if (copy_from_user(elements, args.elements,
 					   args.count * sizeof(struct vchiq_element)) == 0)
-				ret = vchiq_ioc_queue_message(args.handle, elements,
+				ret = vchiq_ioc_queue_message(instance, args.handle, elements,
 							      args.count);
 			else
 				ret = -EFAULT;
@@ -789,7 +787,7 @@ vchiq_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	case VCHIQ_IOC_GET_CLIENT_ID: {
 		unsigned int handle = (unsigned int)arg;
 
-		ret = vchiq_get_client_id(handle);
+		ret = vchiq_get_client_id(instance, handle);
 	} break;
 
 	case VCHIQ_IOC_GET_CONFIG: {
@@ -828,7 +826,7 @@ vchiq_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			break;
 		}
 
-		ret = vchiq_set_service_option(args.handle, args.option,
+		ret = vchiq_set_service_option(instance, args.handle, args.option,
 					       args.value);
 	} break;
 
@@ -863,22 +861,23 @@ vchiq_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		vchiq_service_put(service);
 
 	if (ret == 0) {
-		if (status == VCHIQ_ERROR)
+		if (status == -EINVAL)
 			ret = -EIO;
-		else if (status == VCHIQ_RETRY)
+		else if (status == -EAGAIN)
 			ret = -EINTR;
 	}
 
-	if ((status == VCHIQ_SUCCESS) && (ret < 0) && (ret != -EINTR) && (ret != -EWOULDBLOCK))
-		vchiq_log_info(vchiq_arm_log_level,
-			       "  ioctl instance %pK, cmd %s -> status %d, %ld",
-			       instance, (_IOC_NR(cmd) <= VCHIQ_IOC_MAX) ?
-			       ioctl_names[_IOC_NR(cmd)] : "<invalid>", status, ret);
-	else
-		vchiq_log_trace(vchiq_arm_log_level,
+	if (!status && (ret < 0) && (ret != -EINTR) && (ret != -EWOULDBLOCK)) {
+		vchiq_log_debug(instance->state->dev, VCHIQ_ARM,
 				"  ioctl instance %pK, cmd %s -> status %d, %ld",
 				instance, (_IOC_NR(cmd) <= VCHIQ_IOC_MAX) ?
 				ioctl_names[_IOC_NR(cmd)] : "<invalid>", status, ret);
+	} else {
+		vchiq_log_trace(instance->state->dev, VCHIQ_ARM,
+				"  ioctl instance %pK, cmd %s -> status %d, %ld",
+				instance, (_IOC_NR(cmd) <= VCHIQ_IOC_MAX) ?
+				ioctl_names[_IOC_NR(cmd)] : "<invalid>", status, ret);
+	}
 
 	return ret;
 }
@@ -909,6 +908,7 @@ vchiq_compat_ioctl_create_service(struct file *file, unsigned int cmd,
 {
 	struct vchiq_create_service args;
 	struct vchiq_create_service32 args32;
+	struct vchiq_instance *instance = file->private_data;
 	long ret;
 
 	if (copy_from_user(&args32, ptrargs32, sizeof(args32)))
@@ -927,12 +927,12 @@ vchiq_compat_ioctl_create_service(struct file *file, unsigned int cmd,
 		.handle  = args32.handle,
 	};
 
-	ret = vchiq_ioc_create_service(file->private_data, &args);
+	ret = vchiq_ioc_create_service(instance, &args);
 	if (ret < 0)
 		return ret;
 
 	if (put_user(args.handle, &ptrargs32->handle)) {
-		vchiq_remove_service(args.handle);
+		vchiq_remove_service(instance, args.handle);
 		return -EFAULT;
 	}
 
@@ -961,6 +961,7 @@ vchiq_compat_ioctl_queue_message(struct file *file,
 	struct vchiq_queue_message args;
 	struct vchiq_queue_message32 args32;
 	struct vchiq_service *service;
+	struct vchiq_instance *instance = file->private_data;
 	int ret;
 
 	if (copy_from_user(&args32, arg, sizeof(args32)))
@@ -975,7 +976,7 @@ vchiq_compat_ioctl_queue_message(struct file *file,
 	if (args32.count > MAX_ELEMENTS)
 		return -EINVAL;
 
-	service = find_service_for_instance(file->private_data, args.handle);
+	service = find_service_for_instance(instance, args.handle);
 	if (!service)
 		return -EINVAL;
 
@@ -995,7 +996,7 @@ vchiq_compat_ioctl_queue_message(struct file *file,
 				compat_ptr(element32[count].data);
 			elements[count].size = element32[count].size;
 		}
-		ret = vchiq_ioc_queue_message(args.handle, elements,
+		ret = vchiq_ioc_queue_message(instance, args.handle, elements,
 					      args.count);
 	} else {
 		ret = -EINVAL;
@@ -1169,10 +1170,10 @@ static int vchiq_open(struct inode *inode, struct file *file)
 	struct vchiq_state *state = vchiq_get_state();
 	struct vchiq_instance *instance;
 
-	vchiq_log_info(vchiq_arm_log_level, "vchiq_open");
+	vchiq_log_debug(state->dev, VCHIQ_ARM, "vchiq_open");
 
 	if (!state) {
-		vchiq_log_error(vchiq_arm_log_level,
+		vchiq_log_error(state->dev, VCHIQ_ARM,
 				"vchiq has no connection to VideoCore");
 		return -ENOTCONN;
 	}
@@ -1205,8 +1206,8 @@ static int vchiq_release(struct inode *inode, struct file *file)
 	int ret = 0;
 	int i;
 
-	vchiq_log_info(vchiq_arm_log_level, "%s: instance=%lx", __func__,
-		       (unsigned long)instance);
+	vchiq_log_debug(state->dev, VCHIQ_ARM, "%s: instance=%lx", __func__,
+			(unsigned long)instance);
 
 	if (!state) {
 		ret = -EPERM;
@@ -1262,7 +1263,7 @@ static int vchiq_release(struct inode *inode, struct file *file)
 			spin_unlock(&msg_queue_spinlock);
 
 			if (header)
-				vchiq_release_message(service->handle, header);
+				vchiq_release_message(instance, service->handle, header);
 			spin_lock(&msg_queue_spinlock);
 		}
 

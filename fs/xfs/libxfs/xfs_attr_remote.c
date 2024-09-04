@@ -543,6 +543,7 @@ xfs_attr_rmtval_stale(
 {
 	struct xfs_mount	*mp = ip->i_mount;
 	struct xfs_buf		*bp;
+	int			error;
 
 	ASSERT(xfs_isilocked(ip, XFS_ILOCK_EXCL));
 
@@ -550,14 +551,18 @@ xfs_attr_rmtval_stale(
 	    XFS_IS_CORRUPT(mp, map->br_startblock == HOLESTARTBLOCK))
 		return -EFSCORRUPTED;
 
-	bp = xfs_buf_incore(mp->m_ddev_targp,
+	error = xfs_buf_incore(mp->m_ddev_targp,
 			XFS_FSB_TO_DADDR(mp, map->br_startblock),
-			XFS_FSB_TO_BB(mp, map->br_blockcount), incore_flags);
-	if (bp) {
-		xfs_buf_stale(bp);
-		xfs_buf_relse(bp);
+			XFS_FSB_TO_BB(mp, map->br_blockcount),
+			incore_flags, &bp);
+	if (error) {
+		if (error == -ENOENT)
+			return 0;
+		return error;
 	}
 
+	xfs_buf_stale(bp);
+	xfs_buf_relse(bp);
 	return 0;
 }
 
@@ -568,7 +573,7 @@ xfs_attr_rmtval_stale(
  */
 int
 xfs_attr_rmtval_find_space(
-	struct xfs_attr_item		*attr)
+	struct xfs_attr_intent		*attr)
 {
 	struct xfs_da_args		*args = attr->xattri_da_args;
 	struct xfs_bmbt_irec		*map = &attr->xattri_map;
@@ -598,7 +603,7 @@ xfs_attr_rmtval_find_space(
  */
 int
 xfs_attr_rmtval_set_blk(
-	struct xfs_attr_item		*attr)
+	struct xfs_attr_intent		*attr)
 {
 	struct xfs_da_args		*args = attr->xattri_da_args;
 	struct xfs_inode		*dp = args->dp;
@@ -674,7 +679,7 @@ xfs_attr_rmtval_invalidate(
  */
 int
 xfs_attr_rmtval_remove(
-	struct xfs_attr_item		*attr)
+	struct xfs_attr_intent		*attr)
 {
 	struct xfs_da_args		*args = attr->xattri_da_args;
 	int				error, done;

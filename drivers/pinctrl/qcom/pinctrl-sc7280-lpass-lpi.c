@@ -141,7 +141,6 @@ static const struct lpi_pinctrl_variant_data sc7280_lpi_data = {
 	.ngroups = ARRAY_SIZE(sc7280_groups),
 	.functions = sc7280_functions,
 	.nfunctions = ARRAY_SIZE(sc7280_functions),
-	.is_clk_optional = true,
 };
 
 static const struct of_device_id lpi_pinctrl_of_match[] = {
@@ -159,7 +158,7 @@ static struct platform_driver lpi_pinctrl_driver = {
 		   .of_match_table = lpi_pinctrl_of_match,
 	},
 	.probe = lpi_pinctrl_probe,
-	.remove = lpi_pinctrl_remove,
+	.remove_new = lpi_pinctrl_remove,
 };
 
 module_platform_driver(lpi_pinctrl_driver);

@@ -2,7 +2,7 @@
 /*
  * Driver for Broadcom MPI3 Storage Controllers
  *
- * Copyright (C) 2017-2022 Broadcom Inc.
+ * Copyright (C) 2017-2023 Broadcom Inc.
  *  (mailto: mpi3mr-linuxdrv.pdl@broadcom.com)
  *
  */
@@ -293,7 +293,6 @@ out:
 static long mpi3mr_get_all_tgt_info(struct mpi3mr_ioc *mrioc,
 	struct bsg_job *job)
 {
-	long rval = -EINVAL;
 	u16 num_devices = 0, i = 0, size;
 	unsigned long flags;
 	struct mpi3mr_tgt_dev *tgtdev;
@@ -304,7 +303,7 @@ static long mpi3mr_get_all_tgt_info(struct mpi3mr_ioc *mrioc,
 	if (job->request_payload.payload_len < sizeof(u32)) {
 		dprint_bsg_err(mrioc, "%s: invalid size argument\n",
 		    __func__);
-		return rval;
+		return -EINVAL;
 	}
 
 	spin_lock_irqsave(&mrioc->tgtdev_lock, flags);
@@ -312,7 +311,7 @@ static long mpi3mr_get_all_tgt_info(struct mpi3mr_ioc *mrioc,
 		num_devices++;
 	spin_unlock_irqrestore(&mrioc->tgtdev_lock, flags);
 
-	if ((job->request_payload.payload_len == sizeof(u32)) ||
+	if ((job->request_payload.payload_len <= sizeof(u64)) ||
 		list_empty(&mrioc->tgtdev_list)) {
 		sg_copy_from_buffer(job->request_payload.sg_list,
 				    job->request_payload.sg_cnt,
@@ -320,14 +319,14 @@ static long mpi3mr_get_all_tgt_info(struct mpi3mr_ioc *mrioc,
 		return 0;
 	}
 
-	kern_entrylen = (num_devices - 1) * sizeof(*devmap_info);
-	size = sizeof(*alltgt_info) + kern_entrylen;
+	kern_entrylen = num_devices * sizeof(*devmap_info);
+	size = sizeof(u64) + kern_entrylen;
 	alltgt_info = kzalloc(size, GFP_KERNEL);
 	if (!alltgt_info)
 		return -ENOMEM;
 
 	devmap_info = alltgt_info->dmi;
-	memset((u8 *)devmap_info, 0xFF, (kern_entrylen + sizeof(*devmap_info)));
+	memset((u8 *)devmap_info, 0xFF, kern_entrylen);
 	spin_lock_irqsave(&mrioc->tgtdev_lock, flags);
 	list_for_each_entry(tgtdev, &mrioc->tgtdev_list, list) {
 		if (i < num_devices) {
@@ -344,25 +343,18 @@ static long mpi3mr_get_all_tgt_info(struct mpi3mr_ioc *mrioc,
 	num_devices = i;
 	spin_unlock_irqrestore(&mrioc->tgtdev_lock, flags);
 
-	memcpy(&alltgt_info->num_devices, &num_devices, sizeof(num_devices));
+	alltgt_info->num_devices = num_devices;
 
-	usr_entrylen = (job->request_payload.payload_len - sizeof(u32)) / sizeof(*devmap_info);
+	usr_entrylen = (job->request_payload.payload_len - sizeof(u64)) /
+		sizeof(*devmap_info);
 	usr_entrylen *= sizeof(*devmap_info);
 	min_entrylen = min(usr_entrylen, kern_entrylen);
-	if (min_entrylen && (!memcpy(&alltgt_info->dmi, devmap_info, min_entrylen))) {
-		dprint_bsg_err(mrioc, "%s:%d: device map info copy failed\n",
-		    __func__, __LINE__);
-		rval = -EFAULT;
-		goto out;
-	}
 
 	sg_copy_from_buffer(job->request_payload.sg_list,
 			    job->request_payload.sg_cnt,
-			    alltgt_info, job->request_payload.payload_len);
-	rval = 0;
-out:
+			    alltgt_info, (min_entrylen + sizeof(u64)));
 	kfree(alltgt_info);
-	return rval;
+	return 0;
 }
 /**
  * mpi3mr_get_change_count - Get topology change count
@@ -894,7 +886,7 @@ static int mpi3mr_build_nvme_prp(struct mpi3mr_ioc *mrioc,
 			 * each time through the loop.
 			 */
 			*prp_entry = cpu_to_le64(dma_addr);
-			if (*prp1_entry & sgemod_mask) {
+			if (*prp_entry & sgemod_mask) {
 				dprint_bsg_err(mrioc,
 				    "%s: PRP address collides with SGE modifier\n",
 				    __func__);
@@ -903,7 +895,7 @@ static int mpi3mr_build_nvme_prp(struct mpi3mr_ioc *mrioc,
 			*prp_entry &= ~sgemod_mask;
 			*prp_entry |= sgemod_val;
 			prp_entry++;
-			prp_entry_dma++;
+			prp_entry_dma += prp_size;
 		}
 
 		/*
@@ -930,6 +922,7 @@ err_out:
 /**
  * mpi3mr_bsg_process_mpt_cmds - MPI Pass through BSG handler
  * @job: BSG job reference
+ * @reply_payload_rcv_len: length of payload recvd
  *
  * This function is the top level handler for MPI Pass through
  * command, this does basic validation of the input data buffers,
@@ -1479,6 +1472,7 @@ static int mpi3mr_bsg_request(struct bsg_job *job)
 
 /**
  * mpi3mr_bsg_exit - de-registration from bsg layer
+ * @mrioc: Adapter instance reference
  *
  * This will be called during driver unload and all
  * bsg resources allocated during load will be freed.
@@ -1487,32 +1481,33 @@ static int mpi3mr_bsg_request(struct bsg_job *job)
  */
 void mpi3mr_bsg_exit(struct mpi3mr_ioc *mrioc)
 {
+	struct device *bsg_dev = &mrioc->bsg_dev;
 	if (!mrioc->bsg_queue)
 		return;
 
 	bsg_remove_queue(mrioc->bsg_queue);
 	mrioc->bsg_queue = NULL;
 
-	device_del(mrioc->bsg_dev);
-	put_device(mrioc->bsg_dev);
-	kfree(mrioc->bsg_dev);
+	device_del(bsg_dev);
+	put_device(bsg_dev);
 }
 
 /**
  * mpi3mr_bsg_node_release -release bsg device node
  * @dev: bsg device node
  *
- * decrements bsg dev reference count
+ * decrements bsg dev parent reference count
  *
  * Return:Nothing
  */
 static void mpi3mr_bsg_node_release(struct device *dev)
 {
-	put_device(dev);
+	put_device(dev->parent);
 }
 
 /**
  * mpi3mr_bsg_init -  registration with bsg layer
+ * @mrioc: Adapter instance reference
  *
  * This will be called during driver load and it will
  * register driver with bsg layer
@@ -1521,41 +1516,37 @@ static void mpi3mr_bsg_node_release(struct device *dev)
  */
 void mpi3mr_bsg_init(struct mpi3mr_ioc *mrioc)
 {
-	mrioc->bsg_dev = kzalloc(sizeof(struct device), GFP_KERNEL);
-	if (!mrioc->bsg_dev) {
-		ioc_err(mrioc, "bsg device mem allocation failed\n");
+	struct device *bsg_dev = &mrioc->bsg_dev;
+	struct device *parent = &mrioc->shost->shost_gendev;
+
+	device_initialize(bsg_dev);
+
+	bsg_dev->parent = get_device(parent);
+	bsg_dev->release = mpi3mr_bsg_node_release;
+
+	dev_set_name(bsg_dev, "mpi3mrctl%u", mrioc->id);
+
+	if (device_add(bsg_dev)) {
+		ioc_err(mrioc, "%s: bsg device add failed\n",
+		    dev_name(bsg_dev));
+		put_device(bsg_dev);
 		return;
 	}
 
-	device_initialize(mrioc->bsg_dev);
-	dev_set_name(mrioc->bsg_dev, "mpi3mrctl%u", mrioc->id);
-
-	if (device_add(mrioc->bsg_dev)) {
-		ioc_err(mrioc, "%s: bsg device add failed\n",
-		    dev_name(mrioc->bsg_dev));
-		goto err_device_add;
-	}
-
-	mrioc->bsg_dev->release = mpi3mr_bsg_node_release;
-
-	mrioc->bsg_queue = bsg_setup_queue(mrioc->bsg_dev, dev_name(mrioc->bsg_dev),
+	mrioc->bsg_queue = bsg_setup_queue(bsg_dev, dev_name(bsg_dev),
 			mpi3mr_bsg_request, NULL, 0);
 	if (IS_ERR(mrioc->bsg_queue)) {
 		ioc_err(mrioc, "%s: bsg registration failed\n",
-		    dev_name(mrioc->bsg_dev));
-		goto err_setup_queue;
+		    dev_name(bsg_dev));
+		device_del(bsg_dev);
+		put_device(bsg_dev);
+		return;
 	}
 
 	blk_queue_max_segments(mrioc->bsg_queue, MPI3MR_MAX_APP_XFER_SEGMENTS);
 	blk_queue_max_hw_sectors(mrioc->bsg_queue, MPI3MR_MAX_APP_XFER_SECTORS);
 
 	return;
-
-err_setup_queue:
-	device_del(mrioc->bsg_dev);
-	put_device(mrioc->bsg_dev);
-err_device_add:
-	kfree(mrioc->bsg_dev);
 }
 
 /**
@@ -1693,7 +1684,7 @@ logging_level_store(struct device *dev,
 static DEVICE_ATTR_RW(logging_level);
 
 /**
- * adapter_state_show - SysFS callback for adapter state show
+ * adp_state_show() - SysFS callback for adapter state show
  * @dev: class device
  * @attr: Device attributes
  * @buf: Buffer to copy

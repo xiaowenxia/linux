@@ -20,7 +20,10 @@ x509_key_parser-y := \
 	x509.asn1.o \
 	x509_akid.asn1.o \
 	x509_cert_parser.o \
+	x509_loader.o \
 	x509_public_key.o
+obj-$(CONFIG_FIPS_SIGNATURE_SELFTEST) += x509_selftest.o
+x509_selftest-y += selftest.o
 
 $(obj)/x509_cert_parser.o: \
 	$(obj)/x509.asn1.h \

@@ -37,7 +37,6 @@
 
 #include "i915_drv.h"
 #include "i915_sysfs.h"
-#include "intel_pm.h"
 
 struct drm_i915_private *kdev_minor_to_i915(struct device *kdev)
 {
@@ -166,7 +165,14 @@ static ssize_t error_state_read(struct file *filp, struct kobject *kobj,
 	struct device *kdev = kobj_to_dev(kobj);
 	struct drm_i915_private *i915 = kdev_minor_to_i915(kdev);
 	struct i915_gpu_coredump *gpu;
-	ssize_t ret;
+	ssize_t ret = 0;
+
+	/*
+	 * FIXME: Concurrent clients triggering resets and reading + clearing
+	 * dumps can cause inconsistent sysfs reads when a user calls in with a
+	 * non-zero offset to complete a prior partial read but the
+	 * gpu_coredump has been cleared or replaced.
+	 */
 
 	gpu = i915_first_error_state(i915);
 	if (IS_ERR(gpu)) {
@@ -178,8 +184,10 @@ static ssize_t error_state_read(struct file *filp, struct kobject *kobj,
 		const char *str = "No error state collected\n";
 		size_t len = strlen(str);
 
-		ret = min_t(size_t, count, len - off);
-		memcpy(buf, str + off, ret);
+		if (off < len) {
+			ret = min_t(size_t, count, len - off);
+			memcpy(buf, str + off, ret);
+		}
 	}
 
 	return ret;
@@ -209,7 +217,8 @@ static const struct bin_attribute error_state_attr = {
 static void i915_setup_error_capture(struct device *kdev)
 {
 	if (sysfs_create_bin_file(&kdev->kobj, &error_state_attr))
-		DRM_ERROR("error_state sysfs setup failed\n");
+		drm_err(&kdev_minor_to_i915(kdev)->drm,
+			"error_state sysfs setup failed\n");
 }
 
 static void i915_teardown_error_capture(struct device *kdev)
@@ -259,4 +268,6 @@ void i915_teardown_sysfs(struct drm_i915_private *dev_priv)
 
 	device_remove_bin_file(kdev,  &dpf_attrs_1);
 	device_remove_bin_file(kdev,  &dpf_attrs);
+
+	kobject_put(dev_priv->sysfs_gt);
 }
